@@ -12,6 +12,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -105,6 +106,25 @@ def get_user_tracked_venues(token: str):
 
 
 LAST_FAILURE_DIAG = {}
+RATE_LIMIT_LOCK = threading.Lock()
+LAST_403_TIME = 0.0
+
+def wait_for_rate_limit_cooloff():
+    """Global circuit breaker: if any worker thread receives a 403, pause all workers for 15s."""
+    global LAST_403_TIME
+    with RATE_LIMIT_LOCK:
+        now = time.time()
+        elapsed = now - LAST_403_TIME
+        if elapsed < 15.0:
+            remaining = 15.0 - elapsed
+            time.sleep(remaining)
+
+def trigger_rate_limit_backoff():
+    """Trigger the circuit breaker cooldown when Cloudflare 403/429 is encountered."""
+    global LAST_403_TIME
+    with RATE_LIMIT_LOCK:
+        LAST_403_TIME = time.time()
+    time.sleep(15.0)
 
 def scrape_venue_movies(item):
     """Scrape movies playing at a specific cinema hall using curl_cffi."""
@@ -124,8 +144,11 @@ def scrape_venue_movies(item):
     seen = set()
     parse_error = None
 
+    # Respect any active global 403 cooldown before starting
+    wait_for_rate_limit_cooloff()
+
     # Polite jitter to avoid Cloudflare rate limit burst detection
-    time.sleep(random.uniform(0.04, 0.10))
+    time.sleep(random.uniform(0.30, 0.60))
 
     try:
         # Primary attempt with chrome131
@@ -134,7 +157,7 @@ def scrape_venue_movies(item):
         # Fallback attempt with backoff if chrome131 gets rate-limited or non-200
         if res.status_code != 200:
             if "Attention Required" in res.text or res.status_code in (403, 429):
-                time.sleep(random.uniform(1.5, 2.5))
+                trigger_rate_limit_backoff()
             try:
                 res_fallback = cffi_requests.get(url, headers=headers, impersonate="safari18_0", timeout=REQUEST_TIMEOUT)
                 if res_fallback.status_code == 200:
@@ -201,11 +224,18 @@ def scrape_venue_movies(item):
 
         parse_initial_state_events(res.text)
 
-        # Multi-Date Lookahead: If upcoming active dates exist (e.g. tomorrow), inspect next active date
-        # so weekend/daytime shows (like Sunday 3D) are never missed when today's daytime shows have rolled off.
+        # Multi-Date Lookahead: If today's roster is sparse (< 8 movies, e.g. late night roll-off),
+        # or if running in the evening (>= 18:00 IST), inspect next active date so tomorrow's full schedule is mapped.
+        # Cinemas that already have 8+ active movies in daytime do not need double traffic.
         res_next_text = ""
-        if len(active_dates) > 1:
+        now_hour = datetime.datetime.now().hour
+        need_lookahead = len(active_dates) > 1 and (len(movies) < 8 or now_hour >= 18)
+        if need_lookahead:
             try:
+                # Polite pause between Day 1 and Day 2 request
+                time.sleep(random.uniform(0.30, 0.50))
+                wait_for_rate_limit_cooloff()
+
                 canonical_base = res.url.rstrip("/")
                 if re.search(r"/\d{8}$", canonical_base):
                     canonical_base = canonical_base.rsplit("/", 1)[0]
@@ -220,8 +250,8 @@ def scrape_venue_movies(item):
                 if res_next.status_code == 200:
                     res_next_text = res_next.text
                     parse_initial_state_events(res_next.text)
-                elif res_next.status_code in (403, 429):
-                    time.sleep(random.uniform(0.5, 1.2))
+                elif res_next.status_code in (403, 429) or "Attention Required" in res_next.text:
+                    trigger_rate_limit_backoff()
                     res_next_fb = cffi_requests.get(
                         next_date_url,
                         headers=headers,
@@ -383,7 +413,7 @@ def main():
             pass
 
     print(f"[CATALOG SYNC] Total cities queued for sync: {len(ordered_cities)}")
-    print(f"[CATALOG SYNC] Running city-batched sync (max 4 workers per city)...\n")
+    print(f"[CATALOG SYNC] Running city-batched sync (max 3 workers per city)...\n")
 
     synced_cities = 0
     total_active_venues = 0
@@ -403,8 +433,8 @@ def main():
         active_in_city = 0
         status_counts = {}
 
-        # Scrape all venues in this city concurrently (4 workers for smooth pacing)
-        with ThreadPoolExecutor(max_workers=min(4, len(venue_items) or 1)) as executor:
+        # Scrape all venues in this city concurrently (3 workers for polite pacing)
+        with ThreadPoolExecutor(max_workers=min(3, len(venue_items) or 1)) as executor:
             futures = {executor.submit(scrape_venue_movies, it): it for it in venue_items}
             for fut in as_completed(futures):
                 vcode, _, movies, status = fut.result()
@@ -444,7 +474,7 @@ def main():
                     idx, len(ordered_cities), cname, ccode, len(venues), city_elapsed
                 )
             )
-            time.sleep(0.05)
+            time.sleep(random.uniform(10.0, 15.0))
             continue
 
         # Merge with city explore page if needed
@@ -477,7 +507,8 @@ def main():
                 )
             )
 
-        time.sleep(0.8)
+        # Inter-city cooling pause: allows Cloudflare WAF rate-limit leaky bucket to reset
+        time.sleep(random.uniform(6.0, 10.0))
 
 
     elapsed = time.time() - start_time
