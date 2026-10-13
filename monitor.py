@@ -540,13 +540,115 @@ def sync_city_movies_to_cloudflare(token: str, city_code: str = "HYD"):
     return True
 
 
+# -------------------------------------------------------------
+# CITY & GPS COORDINATES REGISTRY
+# -------------------------------------------------------------
+_CITY_REGISTRY_CACHE = None
+
+CORE_CITY_FALLBACKS = {
+    "HYD": {"name": "Hyderabad", "slug": "hyderabad", "lat": "17.385044", "lon": "78.486671"},
+    "NCR": {"name": "Delhi-NCR", "slug": "national-capital-region-ncr", "lat": "28.6139", "lon": "77.209"},
+    "MUMBAI": {"name": "Mumbai", "slug": "mumbai", "lat": "19.076", "lon": "72.8777"},
+    "BANG": {"name": "Bengaluru", "slug": "bengaluru", "lat": "12.9715987", "lon": "77.5945627"},
+    "KANP": {"name": "Kanpur", "slug": "kanpur", "lat": "26.4634", "lon": "80.3229"},
+    "LUCK": {"name": "Lucknow", "slug": "lucknow", "lat": "26.8465108", "lon": "80.9466832"},
+    "PUNE": {"name": "Pune", "slug": "pune", "lat": "18.5204303", "lon": "73.8567437"},
+    "AHD": {"name": "Ahmedabad", "slug": "ahmedabad", "lat": "23.0395677", "lon": "72.5660045"},
+    "CHEN": {"name": "Chennai", "slug": "chennai", "lat": "13.056", "lon": "80.206"},
+    "KOLK": {"name": "Kolkata", "slug": "kolkata", "lat": "22.641", "lon": "88.411"},
+    "CHD": {"name": "Chandigarh", "slug": "chandigarh", "lat": "30.7333148", "lon": "76.7794179"},
+    "KOCH": {"name": "Kochi", "slug": "kochi", "lat": "9.9312328", "lon": "76.2673041"},
+}
+
+
+def load_city_registry() -> dict:
+    global _CITY_REGISTRY_CACHE
+    if _CITY_REGISTRY_CACHE is not None:
+        return _CITY_REGISTRY_CACHE
+
+    registry = dict(CORE_CITY_FALLBACKS)
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    for filename in ("all_cities.json", "cities.json"):
+        path = os.path.join(data_dir, filename)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        registry.update(loaded)
+                        break
+            except Exception as e:
+                print(f"[CITY REGISTRY] Notice: Could not read {filename}: {e}")
+
+    _CITY_REGISTRY_CACHE = registry
+    return registry
+
+
+def resolve_city_info(city_code: str, tracker: dict = None) -> dict:
+    """
+    Resolves accurate BookMyShow city slug, latitude, and longitude.
+    Detects and overrides bogus Hyderabad coordinate fallbacks (17.385, 78.487)
+    when assigned to non-Hyderabad cities.
+    """
+    c_code = (city_code or "HYD").strip().upper()
+    registry = load_city_registry()
+    city_data = registry.get(c_code, {})
+
+    default_name = city_data.get("name", c_code)
+    default_slug = city_data.get("slug", c_code.lower())
+    default_lat = city_data.get("lat", "17.385044" if c_code == "HYD" else "0")
+    default_lon = city_data.get("lon", "78.486671" if c_code == "HYD" else "0")
+
+    if not tracker:
+        return {
+            "code": c_code,
+            "name": default_name,
+            "slug": default_slug,
+            "lat": default_lat,
+            "lon": default_lon,
+        }
+
+    raw_slug = tracker.get("citySlug")
+    raw_lat = tracker.get("lat")
+    raw_lon = tracker.get("lon")
+
+    # Detect stale Hyderabad coordinate defaults erroneously assigned to other cities
+    is_bogus_hyd_coords = (
+        c_code != "HYD"
+        and raw_lat is not None
+        and raw_lon is not None
+        and (str(raw_lat).startswith("17.385") and str(raw_lon).startswith("78.487"))
+    )
+
+    # Detect stale Hyderabad slug assigned to other cities
+    is_bogus_hyd_slug = (
+        c_code != "HYD"
+        and raw_slug == "hyderabad"
+    )
+
+    final_slug = default_slug if (not raw_slug or is_bogus_hyd_slug) else raw_slug
+    final_lat = default_lat if (not raw_lat or is_bogus_hyd_coords or str(raw_lat) == "0") else str(raw_lat)
+    final_lon = default_lon if (not raw_lon or is_bogus_hyd_coords or str(raw_lon) == "0") else str(raw_lon)
+
+    return {
+        "code": c_code,
+        "name": tracker.get("cityName") or default_name,
+        "slug": final_slug,
+        "lat": final_lat,
+        "lon": final_lon,
+    }
+
+
 def check_dynamic_all_venues(tracker: dict, token: str) -> bool:
     """Scans all venues in a city for an active movie using the BMS showtimes-by-event API."""
     chat_id = tracker.get("chatId")
     city_code = tracker.get("cityCode", "HYD")
-    city_slug = tracker.get("citySlug", "hyderabad")
-    lat = tracker.get("lat", "17.385")
-    lon = tracker.get("lon", "78.487")
+
+    city_info = resolve_city_info(city_code, tracker)
+    city_slug = city_info["slug"]
+    lat = city_info["lat"]
+    lon = city_info["lon"]
+
     movie_title = tracker.get("movieTitle", "Movie")
     screen_filter = tracker.get("filter", "ANY")
     event_code = tracker.get("eventCode", "").strip()
@@ -556,7 +658,7 @@ def check_dynamic_all_venues(tracker: dict, token: str) -> bool:
     if is_initialized is None:
         is_initialized = len(known_sessions) > 0
 
-    print(f"\n[DYNAMIC] 🔍 Checking ALL venues tracker: {movie_title} in {city_code} | Filter: {screen_filter} | Initialized: {is_initialized}")
+    print(f"\n[DYNAMIC] 🔍 Checking ALL venues tracker: {movie_title} in {city_code} (slug: {city_slug}, lat: {lat}, lon: {lon}) | Filter: {screen_filter} | Initialized: {is_initialized}")
 
     codes = [c.strip() for c in event_code.split(",") if c.strip()]
     if not codes:
@@ -567,6 +669,9 @@ def check_dynamic_all_venues(tracker: dict, token: str) -> bool:
         "Referer": "https://in.bookmyshow.com/",
         "x-app-code": "WEB",
         "x-region-code": city_code,
+        "x-region-slug": city_slug,
+        "x-latitude": str(lat),
+        "x-longitude": str(lon),
         "Cookie": f"Rgn=|Code={city_code}|; bms_region={city_code.lower()}; bms_location={city_slug}",
     }
 
@@ -685,7 +790,8 @@ def check_single_dynamic_tracker(tracker: dict, token: str) -> bool:
         return check_dynamic_all_venues(tracker, token)
 
     city_code = tracker.get("cityCode", "HYD")
-    city_slug = tracker.get("citySlug", "hyderabad")
+    city_info = resolve_city_info(city_code, tracker)
+    city_slug = city_info["slug"]
     venue_name = tracker.get("venueName", "Prasads Multiplex")
     movie_title = tracker.get("movieTitle", "Movie")
     screen_filter = tracker.get("filter", "ANY")
@@ -695,7 +801,7 @@ def check_single_dynamic_tracker(tracker: dict, token: str) -> bool:
     if is_initialized is None:
         is_initialized = len(known_sessions) > 0
 
-    print(f"\n[DYNAMIC] 🔍 Checking tracker: {movie_title} in {city_code} ({venue_name}) | Filter: {screen_filter} | PreRelease: {is_pre_release} | Initialized: {is_initialized}")
+    print(f"\n[DYNAMIC] 🔍 Checking tracker: {movie_title} in {city_code} ({venue_name}, slug: {city_slug}) | Filter: {screen_filter} | PreRelease: {is_pre_release} | Initialized: {is_initialized}")
 
     venue_slug = slugify(venue_name)
     base_url = f"https://in.bookmyshow.com/cinemas/{city_slug}/{venue_slug}/{venue_code}"
@@ -705,6 +811,7 @@ def check_single_dynamic_tracker(tracker: dict, token: str) -> bool:
     headers = {
         "Referer": "https://in.bookmyshow.com/",
         "x-region-code": city_code,
+        "x-region-slug": city_slug,
         "Cookie": f"Rgn=|Code={city_code}|; bms_region={city_code.lower()}; bms_location={city_slug}",
     }
 

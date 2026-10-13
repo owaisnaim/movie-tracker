@@ -108,23 +108,25 @@ def get_user_tracked_venues(token: str):
 LAST_FAILURE_DIAG = {}
 RATE_LIMIT_LOCK = threading.Lock()
 LAST_403_TIME = 0.0
+TRACKED_VENUES = set()
 
 def wait_for_rate_limit_cooloff():
-    """Global circuit breaker: if any worker thread receives a 403, pause all workers for 15s."""
+    """Global circuit breaker: if any worker received a 403, pause before next request without blocking the lock."""
     global LAST_403_TIME
+    sleep_needed = 0.0
     with RATE_LIMIT_LOCK:
-        now = time.time()
-        elapsed = now - LAST_403_TIME
-        if elapsed < 15.0:
-            remaining = 15.0 - elapsed
-            time.sleep(remaining)
+        elapsed = time.time() - LAST_403_TIME
+        if elapsed < 6.0:
+            sleep_needed = 6.0 - elapsed
+    if sleep_needed > 0:
+        time.sleep(sleep_needed)
 
 def trigger_rate_limit_backoff():
-    """Trigger the circuit breaker cooldown when Cloudflare 403/429 is encountered."""
+    """Record 403 timestamp and sleep briefly without holding lock."""
     global LAST_403_TIME
     with RATE_LIMIT_LOCK:
         LAST_403_TIME = time.time()
-    time.sleep(15.0)
+    time.sleep(random.uniform(3.0, 5.0))
 
 def scrape_venue_movies(item):
     """Scrape movies playing at a specific cinema hall using curl_cffi."""
@@ -148,7 +150,7 @@ def scrape_venue_movies(item):
     wait_for_rate_limit_cooloff()
 
     # Polite jitter to avoid Cloudflare rate limit burst detection
-    time.sleep(random.uniform(0.30, 0.60))
+    time.sleep(random.uniform(0.10, 0.25))
 
     try:
         # Primary attempt with chrome131
@@ -224,16 +226,17 @@ def scrape_venue_movies(item):
 
         parse_initial_state_events(res.text)
 
-        # Multi-Date Lookahead: If today's roster is sparse (< 8 movies, e.g. late night roll-off),
-        # or if running in the evening (>= 18:00 IST), inspect next active date so tomorrow's full schedule is mapped.
-        # Cinemas that already have 8+ active movies in daytime do not need double traffic.
+        # Multi-Date Lookahead:
+        # 1. Always inspect Day 2 if this is an actively user-tracked cinema hall (e.g. PRHN Prasads Multiplex).
+        # 2. For other cinemas, only inspect Day 2 if today's roster is sparse (< 5 movies, e.g. late night roll-off).
+        # Cinemas that already have 5+ active movies today do not need redundant Day 2 traffic.
         res_next_text = ""
-        now_hour = datetime.datetime.now().hour
-        need_lookahead = len(active_dates) > 1 and (len(movies) < 8 or now_hour >= 18)
+        is_tracked = vcode in TRACKED_VENUES
+        need_lookahead = len(active_dates) > 1 and (is_tracked or len(movies) < 5)
         if need_lookahead:
             try:
                 # Polite pause between Day 1 and Day 2 request
-                time.sleep(random.uniform(0.30, 0.50))
+                time.sleep(random.uniform(0.15, 0.30))
                 wait_for_rate_limit_cooloff()
 
                 canonical_base = res.url.rstrip("/")
@@ -252,16 +255,6 @@ def scrape_venue_movies(item):
                     parse_initial_state_events(res_next.text)
                 elif res_next.status_code in (403, 429) or "Attention Required" in res_next.text:
                     trigger_rate_limit_backoff()
-                    res_next_fb = cffi_requests.get(
-                        next_date_url,
-                        headers=headers,
-                        impersonate="safari18_0",
-                        timeout=REQUEST_TIMEOUT,
-                        allow_redirects=True,
-                    )
-                    if res_next_fb.status_code == 200:
-                        res_next_text = res_next_fb.text
-                        parse_initial_state_events(res_next_fb.text)
             except Exception:
                 pass
 
@@ -376,6 +369,9 @@ def main():
 
     # 2. Identify Priority User-Tracked Venues & Cities
     tracked_venues = get_user_tracked_venues(token)
+    global TRACKED_VENUES
+    TRACKED_VENUES = set(tracked_venues.keys()) if tracked_venues else set()
+
     ordered_cities = []
     if tracked_venues:
         print(f"[CATALOG SYNC] Found {len(tracked_venues)} active user-tracked cinema hall(s).")
@@ -413,7 +409,7 @@ def main():
             pass
 
     print(f"[CATALOG SYNC] Total cities queued for sync: {len(ordered_cities)}")
-    print(f"[CATALOG SYNC] Running city-batched sync (max 3 workers per city)...\n")
+    print(f"[CATALOG SYNC] Running city-batched sync (max 4 workers per city)...\n")
 
     synced_cities = 0
     total_active_venues = 0
@@ -433,18 +429,36 @@ def main():
         active_in_city = 0
         status_counts = {}
 
-        # Scrape all venues in this city concurrently (3 workers for polite pacing)
-        with ThreadPoolExecutor(max_workers=min(3, len(venue_items) or 1)) as executor:
+        # Scrape all venues in this city concurrently (4 workers for optimal balance)
+        with ThreadPoolExecutor(max_workers=min(4, len(venue_items) or 1)) as executor:
             futures = {executor.submit(scrape_venue_movies, it): it for it in venue_items}
+            done_count = 0
+            consecutive_403 = 0
             for fut in as_completed(futures):
                 vcode, _, movies, status = fut.result()
                 city_venues_map[vcode] = movies
                 status_counts[status] = status_counts.get(status, 0) + 1
+                done_count += 1
                 if movies:
                     active_in_city += 1
                     total_movie_instances += len(movies)
+                    consecutive_403 = 0
                     for m in movies:
                         city_movies_dict[m["code"]] = m["title"]
+                elif status == 403:
+                    consecutive_403 += 1
+
+                # Live progress heartbeat every 25 venues or on completion
+                if done_count % 25 == 0 or done_count == len(venue_items):
+                    print(f"  [{ccode}] Progress: {done_count}/{len(venue_items)} venues checked ({active_in_city} active so far)...")
+
+                # Early-abort circuit breaker: if city suffers 25 consecutive 403s with 0 active movies,
+                # fast-fail this city to save IP reputation, prevent timeouts, and preserve existing KV cache.
+                if consecutive_403 >= 25 and active_in_city == 0:
+                    print(f"  [{ccode}] ⚠️ High WAF block rate detected ({consecutive_403} consecutive 403s). Aborting {cname} early to preserve existing KV cache.")
+                    for remaining_fut in futures:
+                        remaining_fut.cancel()
+                    break
 
         # Log diagnostics so we can see exactly what's failing (especially on CI)
         non_ok = {s: n for s, n in status_counts.items() if s != 200}

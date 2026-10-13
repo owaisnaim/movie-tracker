@@ -499,7 +499,7 @@ async function handleTelegramUpdate(update, env) {
     const parsed = parseBmsUrl(text);
     if (parsed.eventCode) {
       await clearSession(env, chatId);
-      await sendFormatSelection(botToken, chatId, session.cityCode, session.venueCode, parsed.eventCode);
+      await sendFormatSelection(botToken, chatId, session.cityCode, session.venueCode, parsed.eventCode, null, env);
     } else {
       await sendTelegram(botToken, chatId,
         "⚠️ Could not find a valid BookMyShow event code in your message.\n\n" +
@@ -804,6 +804,7 @@ async function searchCities(query, env) {
 
 async function resolveCity(cityCode, env) {
   if (TOP_CITIES[cityCode]) return TOP_CITIES[cityCode];
+  if (typeof BMS_ALL_REGIONS !== "undefined" && BMS_ALL_REGIONS[cityCode]) return BMS_ALL_REGIONS[cityCode];
   if (env && env.TRACKER_DB) {
     const cached = await env.TRACKER_DB.get(`city:${cityCode}`);
     if (cached) return JSON.parse(cached);
