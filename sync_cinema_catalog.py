@@ -30,9 +30,9 @@ CITIES_FILE = os.path.join(DATA_DIR, "cities.json")
 VENUES_FILE = os.path.join(DATA_DIR, "venues.json")
 
 # Concurrency & Batch Settings
-MAX_WORKERS = 8
+MAX_WORKERS = 4
 BATCH_SIZE = 30
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 7
 
 
 def slugify(text: str) -> str:
@@ -228,11 +228,11 @@ def scrape_venue_movies(item):
 
         # Multi-Date Lookahead:
         # 1. Always inspect Day 2 if this is an actively user-tracked cinema hall (e.g. PRHN Prasads Multiplex).
-        # 2. For other cinemas, only inspect Day 2 if today's roster is sparse (< 5 movies, e.g. late night roll-off).
-        # Cinemas that already have 5+ active movies today do not need redundant Day 2 traffic.
+        # 2. For other cinemas, only inspect Day 2 if today has 0 movies (e.g. advance bookings only).
+        # Cinemas that already have active movies playing today do not need redundant Day 2 traffic.
         res_next_text = ""
         is_tracked = vcode in TRACKED_VENUES
-        need_lookahead = len(active_dates) > 1 and (is_tracked or len(movies) < 5)
+        need_lookahead = len(active_dates) > 1 and (is_tracked or len(movies) == 0)
         if need_lookahead:
             try:
                 # Polite pause between Day 1 and Day 2 request
@@ -522,7 +522,7 @@ def main():
             )
 
         # Inter-city cooling pause: allows Cloudflare WAF rate-limit leaky bucket to reset
-        time.sleep(random.uniform(6.0, 10.0))
+        time.sleep(random.uniform(3.0, 5.0))
 
 
     elapsed = time.time() - start_time
